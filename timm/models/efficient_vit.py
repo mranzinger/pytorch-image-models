@@ -6,20 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda import amp
 
-from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from .helpers import named_apply, build_model_with_cfg, checkpoint_seq
-from .layers import ConvNormAct, trunc_normal_, SelectAdaptivePool2d, DropPath, ConvMlp, Mlp, LayerNorm2d,\
-    create_conv2d, get_act_layer, make_divisible, to_ntuple
 from .registry import register_model
 
 
 __all__ = ['EfficientViT']
-
-
-def _cfg(url='', **kwargs):
-    return {
-
-    }
 
 
 @torch.jit.script
@@ -37,7 +27,22 @@ class HardSwish(nn.Module):
         return hard_swish(x)
 
 
-conv_swish = partial(ConvNormAct, act_layer=HardSwish)
+class ConvBNAct(nn.Module):
+    def __init__(self, *args, act=nn.ReLU, **kwargs):
+        super().__init__()
+
+        self.conv = nn.Conv2d(*args, bias=False, **kwargs)
+        self.bn = nn.BatchNorm2d(self.conv.out_channels)
+        self.act = act()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
+
+
+conv_swish = partial(ConvBNAct, act=HardSwish)
 
 
 class FusedMBConv(nn.Module):
@@ -45,7 +50,7 @@ class FusedMBConv(nn.Module):
         super().__init__()
 
         self.body = nn.Sequential(
-            ConvNormAct(in_channels, in_channels * expansion, kernel_size, padding='same', stride=stride),
+            ConvBNAct(in_channels, in_channels * expansion, kernel_size, padding=kernel_size // 2, stride=stride),
             nn.Conv2d(in_channels * expansion, out_channels, 1),
             nn.BatchNorm2d(out_channels)
         )
@@ -65,10 +70,10 @@ class DSConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
 
-        self.branch_a = ConvNormAct(in_channels, out_channels, 3, stride=2, padding='same')
+        self.branch_a = ConvBNAct(in_channels, out_channels, 3, stride=2, padding=1)
         self.branch_b = nn.Sequential(
             nn.MaxPool2d(2),
-            ConvNormAct(in_channels, out_channels, 1)
+            ConvBNAct(in_channels, out_channels, 1)
         )
 
     def forward(self, x):
@@ -106,9 +111,9 @@ class LinearAttentionBlock(nn.Module):
         self.key_dim = key_dim
         self.proj_slice_size = heads * key_dim
 
-        self.projection = ConvNormAct(channels + 2, 3 * self.proj_slice_size, 1)
+        self.projection = ConvBNAct(channels + 2, 3 * self.proj_slice_size, 1)
 
-        self.value_proj_2 = ConvNormAct(heads * key_dim, channels, 1)
+        self.value_proj_2 = ConvBNAct(heads * key_dim, channels, 1)
 
         self.ffn = nn.Sequential(
             conv_swish(channels, channels, 5, padding=2, groups=channels),
@@ -214,7 +219,7 @@ class EfficientViT(nn.Module):
         expansion = 4
 
         self.trunk = nn.Sequential(
-            ConvNormAct(3, 16, 3, padding='same'),
+            ConvBNAct(3, 16, 3, padding=1),
             DSConv(16, 32),
         )
 

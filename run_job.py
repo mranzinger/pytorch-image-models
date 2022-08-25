@@ -12,9 +12,9 @@ from typing import List
 HOSTNAME = platform.node()
 
 
-def launch_job(results_dir, name, args, rest_args: List[str]):
-    print("Creating results dir...")
-    os.makedirs(results_dir, exist_ok=True)
+def launch_job(output_dir, name, args, rest_args: List[str]):
+    print("Creating output dir...")
+    os.makedirs(output_dir, exist_ok=True)
     print("Done")
 
     source_dir = os.path.dirname(__file__)
@@ -22,7 +22,7 @@ def launch_job(results_dir, name, args, rest_args: List[str]):
         source_dir = os.getcwd()
     print('Source directory:', source_dir)
 
-    dest_dir = os.path.join(results_dir, 'source')
+    dest_dir = os.path.join(output_dir, 'source')
 
     work_dir = dest_dir
 
@@ -85,7 +85,7 @@ def launch_job(results_dir, name, args, rest_args: List[str]):
         pass
 
 
-    command_args = rest_args + ['--results', results_dir]
+    command_args = rest_args + ['--output', output_dir]
 
     if args.resume:
         command_args = command_args + ['--resume']
@@ -163,12 +163,12 @@ def launch_job(results_dir, name, args, rest_args: List[str]):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Utility to launch jobs on the cluster.")
-    parser.add_argument('-r', '--results', required=True,
-                        help="Path to the results directory")
+    parser.add_argument('-r', '--output', required=True,
+                        help="Path to the output directory")
     parser.add_argument('--interactive', default=False, action='store_true',
                         help="Run the job in interactive mode")
     parser.add_argument('--resume', default=False, action='store_true',
-                        help="Resume the job with the source in the results dir.")
+                        help="Resume the job with the source in the output dir.")
     parser.add_argument('--partition', default='', type=str,
                         help='Which partition to launch the job on. One of: batch_16GB, batch_32GB, batch_dgx2_singlenode')
     parser.add_argument('--gpus', default=0, type=int, help='The number of GPUs to allocate')
@@ -189,7 +189,7 @@ if __name__ == '__main__':
     parser.add_argument('--dependency', default=None, type=str,
                         help='(Optional) A job-id that this job is dependent upon')
 
-    # Get the results directory without fussing with the rest
+    # Get the output directory without fussing with the rest
     args, rest_args = parser.parse_known_args()
 
     partition = args.partition
@@ -212,9 +212,9 @@ if __name__ == '__main__':
     name = args.name
     if name is None:
         output_dir = os.environ['OUTPUT_DIR']
-        resdir = args.results
+        resdir = args.output
         if resdir.startswith(output_dir):
-            resdir = resdir[len(output_dir)]
+            resdir = resdir[len(output_dir):]
             if resdir.startswith('/'):
                 resdir = resdir[1:]
 
@@ -222,14 +222,14 @@ if __name__ == '__main__':
 
         name = '-'.join(rs_comps)
 
-    results_dir = args.results
+    output_dir = args.output
     names = []
     if args.num_parallel == 1 and args.p_ctr == 0:
-        results_dir = [results_dir]
+        output_dir = [output_dir]
         names.append(name)
     else:
         names = [f'{name}_{i + args.p_ctr}' if name is not None else None for i in range(args.num_parallel)]
-        results_dir = [os.path.join(results_dir, f'run_{i + args.p_ctr}') for i in range(args.num_parallel)]
+        output_dir = [os.path.join(output_dir, f'run_{i + args.p_ctr}') for i in range(args.num_parallel)]
 
-    for d, n in zip(results_dir, names):
+    for d, n in zip(output_dir, names):
         launch_job(d, n, args, rest_args)

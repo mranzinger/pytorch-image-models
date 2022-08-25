@@ -14,6 +14,7 @@ from .dla import *
 from .dpn import *
 from .edgenext import *
 from .efficientnet import *
+from .efficient_vit import *
 from .ghostnet import *
 from .gluon_resnet import *
 from .gluon_xception import *

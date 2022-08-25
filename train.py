@@ -17,6 +17,7 @@ Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 import argparse
 import logging
 import os
+import sys
 import time
 from collections import OrderedDict
 from contextlib import suppress
@@ -68,6 +69,17 @@ except ImportError as e:
 
 torch.backends.cudnn.benchmark = True
 _logger = logging.getLogger('train')
+
+sys.path.append(os.environ.get('SUBMIT_SCRIPTS','.'))
+try:
+    _logger.info('Importing AutoResume lib...')
+    from userlib.auto_resume import AutoResume
+    AutoResume.init()
+    _logger.info('Success!')
+except:
+    _logger.info('Failed!')
+    AutoResume = None
+
 
 # The first arg parser parses out only the --config argument, this argument is used to
 # load a yaml file containing key-values that override the defaults for the main parser below
@@ -480,6 +492,12 @@ def main():
         if args.local_rank == 0:
             _logger.info('AMP not enabled. Training in float32.')
 
+    if AutoResume is not None:
+        auto_resume_details = AutoResume.get_resume_details()
+        if auto_resume_details is not None:
+            checkpoint_path = auto_resume_details['CHECKPOINT_PATH']
+            _logger.info(f'AutoResume: Checkpoint path: {checkpoint_path}')
+            args.resume = checkpoint_path
 
     # optionally resume from a checkpoint
     resume_epoch = None
@@ -687,6 +705,18 @@ def main():
                 # save proper checkpoint with eval metric
                 save_metric = eval_metrics[eval_metric]
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+
+            if saver is not None and AutoResume is not None:
+                if AutoResume.termination_requested():
+                    _logger.info(f'AutoResume: Termination requested!')
+                    if args.rank == 0:
+                        AutoResume.request_resume(
+                            user_dict = {
+                                'CHECKPOINT_PATH': saver.last_save_path
+                            }
+                        )
+                    return
+
 
     except KeyboardInterrupt:
         pass

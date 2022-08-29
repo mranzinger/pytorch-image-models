@@ -380,13 +380,6 @@ def main():
         _logger.info('Training with a single process on 1 GPUs.')
     assert args.rank >= 0
 
-    if args.rank == 0 and args.log_wandb:
-        if has_wandb:
-            wandb.init(project=args.experiment, config=args)
-        else:
-            _logger.warning("You've requested to log metrics to wandb but package not found. "
-                            "Metrics not being logged to wandb, try `pip install wandb`")
-
     # resolve AMP arguments based on PyTorch / Apex availability
     use_amp = None
     if args.amp:
@@ -501,8 +494,9 @@ def main():
 
     # optionally resume from a checkpoint
     resume_epoch = None
+    checkpoint_state = None
     if args.resume:
-        resume_epoch = resume_checkpoint(
+        resume_epoch, checkpoint_state = resume_checkpoint(
             model, args.resume,
             optimizer=None if args.no_resume_opt else optimizer,
             loss_scaler=None if args.no_resume_opt else loss_scaler,
@@ -540,6 +534,27 @@ def main():
         start_epoch = resume_epoch
     if lr_scheduler is not None and start_epoch > 0:
         lr_scheduler.step(start_epoch)
+
+    wandb_id = None
+    if args.rank == 0 and args.log_wandb:
+        if has_wandb:
+            job_type = args.output.split('/')
+            ext_args = dict()
+            if job_type[-1].startswith('run_'):
+                ext_args['name'] = job_type[-1]
+                job_type = job_type[-2]
+            else:
+                job_type = job_type[-1]
+            if checkpoint_state is None:
+                wandb_id = wandb.util.generate_id()
+            else:
+                wandb_id = checkpoint_state.get('wandb_id', None) or wandb.util.generate_id()
+            wandb.init(entity='adlr', project='scene-text', group='timm',
+                       job_type=job_type, config=args, id=wandb_id, resume='allow',
+                       **ext_args)
+        else:
+            _logger.warning("You've requested to log metrics to wandb but package not found. "
+                            "Metrics not being logged to wandb, try `pip install wandb`")
 
     if args.local_rank == 0:
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
@@ -664,7 +679,8 @@ def main():
         decreasing = True if eval_metric == 'loss' else False
         saver = utils.CheckpointSaver(
             model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
-            checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
+            checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist,
+            wandb_id=wandb_id)
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
@@ -706,10 +722,10 @@ def main():
                 save_metric = eval_metrics[eval_metric]
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
 
-            if saver is not None and AutoResume is not None:
+            if AutoResume is not None:
                 if AutoResume.termination_requested():
                     _logger.info(f'AutoResume: Termination requested!')
-                    if args.rank == 0:
+                    if args.rank == 0 and saver is not None:
                         AutoResume.request_resume(
                             user_dict = {
                                 'CHECKPOINT_PATH': saver.last_save_path

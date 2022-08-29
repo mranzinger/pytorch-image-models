@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.cuda import amp
 
 from .registry import register_model
+from .layers import DropPath
 
 
 __all__ = ['EfficientViT']
@@ -44,9 +45,24 @@ class ConvBNAct(nn.Module):
 
 conv_swish = partial(ConvBNAct, act=HardSwish)
 
+DROP_PATH_RATE = 0.2
+
+class ProgressiveDropPath(DropPath):
+    INSTANCE_COUNTER = 0
+
+    def __init__(self, drop_prob: float = 0, scale_by_keep: bool = True):
+        super().__init__(drop_prob, scale_by_keep)
+
+        self.my_instance = ProgressiveDropPath.INSTANCE_COUNTER
+        ProgressiveDropPath.INSTANCE_COUNTER += 1
+
+    def finalize(self):
+        scale = self.my_instance / ProgressiveDropPath.INSTANCE_COUNTER
+        self.drop_prob *= scale
+
 
 class FusedMBConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, expansion=4):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, expansion=4, drop_rate=0.):
         super().__init__()
 
         self.body = nn.Sequential(
@@ -55,14 +71,16 @@ class FusedMBConv(nn.Module):
             nn.BatchNorm2d(out_channels)
         )
         if stride == 1 and in_channels == out_channels:
-            self.shortcut = nn.Identity()
+            self.shortcut = ProgressiveDropPath(drop_rate)
+            self.re_zero = nn.Parameter(torch.tensor(0, dtype=torch.float32), requires_grad=True)
         else:
             self.shortcut = None
 
     def forward(self, x):
         res = self.body(x)
         if self.shortcut is not None:
-            res = res + self.shortcut(x)
+            res = self.shortcut(self.re_zero * res)
+            res = x + res
         return res
 
 
@@ -84,7 +102,7 @@ class DSConv(nn.Module):
 
 
 class Fused_IRB_Group(nn.Module):
-    def __init__(self, in_channels, out_channels, num_blocks, expansion=4):
+    def __init__(self, in_channels, out_channels, num_blocks, expansion=4, drop_rate=DROP_PATH_RATE):
         super().__init__()
 
         self.channels = out_channels
@@ -92,7 +110,7 @@ class Fused_IRB_Group(nn.Module):
         self.head = FusedMBConv(in_channels, out_channels, 3, stride=2, expansion=expansion)
 
         self.tail = nn.Sequential(*[
-            FusedMBConv(out_channels, out_channels, 3, expansion=expansion)
+            FusedMBConv(out_channels, out_channels, 3, expansion=expansion, drop_rate=drop_rate)
             for _ in range(1, num_blocks)
         ])
 
@@ -102,21 +120,75 @@ class Fused_IRB_Group(nn.Module):
         return x
 
 
+class RepConv(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, do_1x1=True, do_depthconv=True, act=nn.ReLU):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.do_1x1 = do_1x1
+        self.do_depthconv = do_depthconv
+        self.stride = stride
+
+        assert not do_depthconv or in_channels == out_channels, "Can only do depth-convolution when in-channels match out-channels"
+
+        self.conv3x3 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1)
+        self.bn_3x3 = nn.BatchNorm2d(out_channels)
+        self.rz_3x3 = nn.Parameter(torch.tensor(0, dtype=torch.float32), requires_grad=True)
+
+        if do_1x1:
+            self.conv1x1 = nn.Conv2d(in_channels, out_channels, 1, stride=stride)
+            self.bn_1x1 = nn.BatchNorm2d(out_channels)
+            self.rz_1x1 = nn.Parameter(torch.tensor(0, dtype=torch.float32), requires_grad=True)
+        if do_depthconv:
+            self.convDW = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, groups=in_channels)
+            self.bn_dw = nn.BatchNorm2d(out_channels)
+            self.rz_dw = nn.Parameter(torch.tensor(1, dtype=torch.float32), requires_grad=True)
+
+        if self.stride > 1:
+            id_mat = torch.eye(in_channels).reshape(in_channels, in_channels, 1, 1)
+            self.register_buffer('weightsID', id_mat)
+
+        self.act = act()
+
+    def forward(self, x):
+        if self.stride > 1:
+            y = F.conv2d(x, self.weightsID, bias=None, stride=self.stride)
+        else:
+            y = x
+
+        y = y + self.rz_3x3 * self.bn_3x3(self.conv3x3(x))
+
+        if self.do_1x1:
+            y = y + self.rz_1x1 * self.bn_1x1(self.conv1x1(x))
+        if self.do_depthconv:
+            y = y + self.rz_dw * self.bn_dw(self.convDW(x))
+
+        y = self.act(y)
+
+        return y
+
+
+rep_swish = partial(RepConv, act=HardSwish)
+
+
 class LinearAttentionBlock(nn.Module):
-    def __init__(self, channels, heads=12, expansion=4, key_dim=16):
+    def __init__(self, channels, heads=12, expansion=4, key_dim=16, drop_rate=DROP_PATH_RATE, eps=1e-8):
         super().__init__()
 
         self.heads = heads
         self.channels = channels
         self.key_dim = key_dim
         self.proj_slice_size = heads * key_dim
+        self.eps = eps
 
         self.projection = ConvBNAct(channels + 2, 3 * self.proj_slice_size, 1)
 
         self.value_proj_2 = ConvBNAct(heads * key_dim, channels, 1)
 
         self.ffn = nn.Sequential(
-            conv_swish(channels, channels, 5, padding=2, groups=channels),
+            rep_swish(channels, channels),
+            rep_swish(channels, channels),
             conv_swish(channels, channels * expansion, 1),
             nn.Conv2d(channels * expansion, channels, 1),
             nn.BatchNorm2d(channels),
@@ -125,6 +197,7 @@ class LinearAttentionBlock(nn.Module):
         self.rz_attn = nn.Parameter(torch.tensor(0, dtype=torch.float32), requires_grad=True)
         self.rz_ffn = nn.Parameter(torch.tensor(0, dtype=torch.float32), requires_grad=True)
         self.embed_strength = nn.Parameter(torch.tensor(-10, dtype=torch.float32), requires_grad=True)
+        self.drop_path = ProgressiveDropPath(drop_rate)
 
     def forward(self, x):
         B, _, H, W = x.shape
@@ -166,8 +239,10 @@ class LinearAttentionBlock(nn.Module):
             # BN1
             denom = torch.matmul(q, k_sum.transpose(1, 2))
 
+            denom = torch.where(denom.detach() > 0, denom, denom + self.eps)
+
             # BNC
-            output = numer / denom.clamp_min(1e-4)
+            output = numer / denom
 
             # BCN
             output = output.transpose(1, 2).contiguous()
@@ -176,10 +251,9 @@ class LinearAttentionBlock(nn.Module):
 
         output = self.value_proj_2(output)
 
-        y = x + self.rz_attn * output
-        # y = x
+        y = x + self.drop_path(self.rz_attn * output)
 
-        z = y + self.rz_ffn * self.ffn(y)
+        z = y + self.drop_path(self.rz_ffn * self.ffn(y))
 
         return z
 
@@ -231,7 +305,11 @@ class EfficientViT(nn.Module):
         ])
 
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.final = nn.Linear(192, num_classes)
+        self.final = nn.Sequential(
+            nn.Linear(192, 1024),
+            HardSwish(),
+            nn.Linear(1024, num_classes)
+        )
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -242,6 +320,8 @@ class EfficientViT(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+            elif isinstance(m, ProgressiveDropPath):
+                m.finalize()
 
     def forward(self, x):
         x = self.trunk(x)

@@ -107,7 +107,7 @@ def resume_checkpoint(model, checkpoint_path, optimizer=None, loss_scaler=None, 
             model.load_state_dict(checkpoint)
             if log_info:
                 _logger.info("Loaded checkpoint '{}'".format(checkpoint_path))
-        return resume_epoch
+        return resume_epoch, checkpoint
     else:
         _logger.error("No checkpoint found at '{}'".format(checkpoint_path))
         raise FileNotFoundError()
@@ -531,7 +531,7 @@ def build_model_with_cfg(
     model = model_cls(**kwargs) if model_cfg is None else model_cls(cfg=model_cfg, **kwargs)
     model.pretrained_cfg = pretrained_cfg
     model.default_cfg = model.pretrained_cfg  # alias for backwards compat
-    
+
     if pruned:
         model = adapt_model_from_file(model, variant)
 
@@ -566,7 +566,7 @@ def build_model_with_cfg(
         model = feature_cls(model, **feature_cfg)
         model.pretrained_cfg = pretrained_cfg_for_features(pretrained_cfg)  # add back default_cfg
         model.default_cfg = model.pretrained_cfg  # alias for backwards compat
-    
+
     return model
 
 

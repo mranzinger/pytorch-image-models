@@ -32,7 +32,8 @@ class CheckpointSaver:
             recovery_dir='',
             decreasing=False,
             max_history=10,
-            unwrap_fn=unwrap_model):
+            unwrap_fn=unwrap_model,
+            **extra_state):
 
         # objects to save state_dicts of
         self.model = model
@@ -40,6 +41,7 @@ class CheckpointSaver:
         self.args = args
         self.model_ema = model_ema
         self.amp_scaler = amp_scaler
+        self.extra_state = dict(extra_state)
 
         # state
         self.checkpoint_files = []  # (filename, metric) tuples in order of decreasing betterness
@@ -60,11 +62,11 @@ class CheckpointSaver:
         self.unwrap_fn = unwrap_fn
         assert self.max_history >= 1
 
-    def save_checkpoint(self, epoch, metric=None):
+    def save_checkpoint(self, epoch, metric=None, **extra_data):
         assert epoch >= 0
         tmp_save_path = os.path.join(self.checkpoint_dir, 'tmp' + self.extension)
         last_save_path = os.path.join(self.checkpoint_dir, 'last' + self.extension)
-        self._save(tmp_save_path, epoch, metric)
+        self._save(tmp_save_path, epoch, metric, **extra_data)
         if os.path.exists(last_save_path):
             os.unlink(last_save_path)  # required for Windows support.
         os.rename(tmp_save_path, last_save_path)
@@ -98,13 +100,15 @@ class CheckpointSaver:
 
         return (None, None) if self.best_metric is None else (self.best_metric, self.best_epoch)
 
-    def _save(self, save_path, epoch, metric=None):
+    def _save(self, save_path, epoch, metric=None, **extra_data):
         save_state = {
             'epoch': epoch,
             'arch': type(self.model).__name__.lower(),
             'state_dict': get_state_dict(self.model, self.unwrap_fn),
             'optimizer': self.optimizer.state_dict(),
             'version': 2,  # version < 2 increments epoch before save
+            **self.extra_state,
+            **extra_data
         }
         if self.args is not None:
             save_state['arch'] = self.args.model

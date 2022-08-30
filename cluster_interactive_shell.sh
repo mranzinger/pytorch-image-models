@@ -19,8 +19,8 @@ submit_job \
            --gpu $GPUS \
            --partition "$PARTITION" \
            $MOUNT_CMD \
-           --workdir "/home/mranzinger/dev/scene-text" \
-           --image "gitlab-master.nvidia.com/adlr/scene-text/scene-text:aws" \
+           --workdir "/home/mranzinger/dev/pytorch-image-models" \
+           --image "gitlab-master.nvidia.com/adlr/scene-text/scene-text:aws-timm" \
            --coolname \
            --interactive \
            --duration 4 \

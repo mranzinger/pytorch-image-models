@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from functools import partial
+import math
 
 import torch
 import torch.nn as nn
@@ -7,7 +8,7 @@ import torch.nn.functional as F
 from torch.cuda import amp
 
 from .registry import register_model
-from .layers import DropPath
+from .layers import DropPath, variance_scaling_
 
 
 __all__ = ['EfficientViT']
@@ -173,7 +174,7 @@ rep_swish = partial(RepConv, act=HardSwish)
 
 
 class LinearAttentionBlock(nn.Module):
-    def __init__(self, channels, heads=12, expansion=4, key_dim=16, drop_rate=DROP_PATH_RATE, eps=1e-8):
+    def __init__(self, channels, heads=12, expansion=4, key_dim=16, drop_rate=DROP_PATH_RATE, eps=1e-7):
         super().__init__()
 
         self.heads = heads
@@ -182,15 +183,16 @@ class LinearAttentionBlock(nn.Module):
         self.proj_slice_size = heads * key_dim
         self.eps = eps
 
-        self.projection = ConvBNAct(channels + 2, 3 * self.proj_slice_size, 1)
+        self.projection = ConvBNAct(channels + 2, 3 * self.proj_slice_size, 1, act=nn.ReLU)
 
-        self.value_proj_2 = ConvBNAct(heads * key_dim, channels, 1)
+        self.value_proj_2 = ConvBNAct(heads * key_dim, channels, 1, act=HardSwish)
 
+        cexp = channels * expansion
         self.ffn = nn.Sequential(
-            rep_swish(channels, channels),
-            rep_swish(channels, channels),
-            conv_swish(channels, channels * expansion, 1),
-            nn.Conv2d(channels * expansion, channels, 1),
+            conv_swish(channels, cexp, 1),
+            rep_swish(cexp, cexp),
+            rep_swish(cexp, cexp),
+            nn.Conv2d(cexp, channels, 1),
             nn.BatchNorm2d(channels),
         )
 
@@ -199,8 +201,23 @@ class LinearAttentionBlock(nn.Module):
         self.embed_strength = nn.Parameter(torch.tensor(-10, dtype=torch.float32), requires_grad=True)
         self.drop_path = ProgressiveDropPath(drop_rate)
 
-    def forward(self, x):
+        variance_scaling_(self.projection.conv.weight, scale=0.02, distribution='truncated_normal')
+        self.projection.bn.weight.data[:2 * self.proj_slice_size].fill_(0)
+        self.projection.bn.bias.data[:2 * self.proj_slice_size].fill_(1 / math.sqrt(key_dim))
+        self.projection.conv.weights_initialized = True
+        self.projection.bn.weights_initialized = True
+
+        self.register_buffer('step', torch.tensor(0, dtype=torch.int64))
+
+    def forward(self, x: torch.Tensor):
         B, _, H, W = x.shape
+
+        step = self.step.item()
+        if self.training:
+            self.step += 1
+
+        if step == 0:
+            self.projection.bn.bias.data[:2 * self.proj_slice_size].mul_(1 / math.sqrt(H * W))
 
         x_pos = torch.arange(0, W, dtype=x.dtype, device=x.device) / 1000
         y_pos = torch.arange(0, H, dtype=x.dtype, device=x.device) / 1000
@@ -218,34 +235,36 @@ class LinearAttentionBlock(nn.Module):
 
         proj = self.projection(x_emb)
 
-        with amp.autocast(enabled=False):
-            proj = proj.float()
-            get_slice = lambda offset: proj[:, offset * self.proj_slice_size : (1 + offset) * self.proj_slice_size].reshape(B * self.heads, self.key_dim, H * W).transpose(1, 2)
+        AUTOCAST = True
+        with amp.autocast(enabled=AUTOCAST):
+            if not AUTOCAST:
+                proj = proj.float()
+            get_slice = lambda offset: proj[:, offset * self.proj_slice_size : (1 + offset) * self.proj_slice_size].reshape(B, self.heads, self.key_dim, H * W).transpose(-2, -1)
 
-            # <batch * heads> x <positions> x <channels> === BNC
-            q = get_slice(0)
-            k = get_slice(1)
-            v = get_slice(2)
+            # <batch> x <heads> x <positions> x <channels> === BHNC
+            q: torch.Tensor = get_slice(0)
+            k: torch.Tensor = get_slice(1)
+            v: torch.Tensor = get_slice(2)
 
-            # BCC
-            ktv = torch.matmul(k.transpose(1, 2), v)
+            # BHCC
+            ktv = torch.matmul(k.transpose(-2, -1), v)
 
-            # BNC
+            # BHNC
             numer = torch.matmul(q, ktv)
 
-            # B1C
-            k_sum = torch.sum(k, dim=1, keepdim=True)
+            # BH1C
+            k_sum = torch.sum(k, dim=-2, keepdim=True)
 
-            # BN1
-            denom = torch.matmul(q, k_sum.transpose(1, 2))
+            # BHN1
+            denom = torch.matmul(q, k_sum.transpose(-2, -1)) + self.eps
 
-            denom = torch.where(denom.detach() > 0, denom, denom + self.eps)
-
-            # BNC
+            # BHNC
             output = numer / denom
 
-            # BCN
-            output = output.transpose(1, 2).contiguous()
+            # print(f'{step} - Numer: ({numer.min().item():0.04f}, {numer.max().item():0.04f}), Denom: ({denom.min().item():0.04f}, {denom.max().item():0.04f}), Output: ({output.min().item():04f}, {output.max().item():0.04f})')
+
+            # BHCN
+            output = output.transpose(-2, -1).contiguous()
 
             output = output.reshape(B, -1, H, W)
 
@@ -312,6 +331,10 @@ class EfficientViT(nn.Module):
         )
 
         for m in self.modules():
+            already_initialized = getattr(m, 'weights_initialized', False)
+            if already_initialized:
+                continue
+
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 # m.weight.data.mul_(0.1)
